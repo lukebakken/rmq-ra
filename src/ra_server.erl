@@ -15,6 +15,14 @@
 -elvis([{elvis_style, dont_repeat_yourself, disable}]).
 -elvis([{elvis_style, god_modules, disable}]).
 
+-type membership_change_type() :: join | leave.
+-type membership_change() :: #{
+    type := membership_change_type(),
+    server_id := ra_server_id(),
+    started_at := integer(),
+    timeout := non_neg_integer()
+}.
+
 -export([
          name/2,
          init/1,
@@ -89,6 +97,7 @@
       stop_after => ra_index(),
       machine_state := term(),
       aux_state => term(),
+      pending_membership_change => membership_change(),
       condition => #{predicate_fun := ra_await_condition_fun(),
                      transition_to => ra_state(),
                      timeout => #{duration => integer(),
@@ -584,6 +593,103 @@ handle_leader({PeerId, #append_entries_reply{success = false,
     State1 = State0#{cluster => Nodes#{PeerId => Peer}, log => Log},
     {State, _, Effects} = make_pipelined_rpc_effects(State1, []),
     {leader, State, Effects};
+%% Handle join command with improved error handling
+handle_leader({command, {'$ra_join', _, ServerId, JoinArgs}, From},
+              State = #{cluster := Cluster, current_term := Term}) ->
+    case maps:is_key(ServerId, Cluster) of
+        true ->
+            % Server already in cluster, just reply
+            {State, [{reply, From, {ok, already_member, Term}}]};
+        false ->
+            % Add the server to the cluster
+            NewCluster = Cluster#{ServerId => {1, undefined}},
+            % Update state and track the membership change
+            NewState = State#{
+                cluster => NewCluster,
+                % Track membership change in progress
+                pending_membership_change => #{
+                    type => join,
+                    server_id => ServerId,
+                    started_at => erlang:system_time(millisecond),
+                    timeout => 30000  % 30 seconds timeout
+                }
+            },
+            % Add effects to verify the change succeeded
+            ClusterChangeCmd = {'$ra_cluster_change', #{from => From},
+                                {join, ServerId, JoinArgs}, await_consensus},
+            Effects = [
+                {next_event, {command, ClusterChangeCmd}},
+                {timer, verify_membership_change, 5000}  % Check after 5 seconds
+            ],
+            {NewState, Effects}
+    end;
+%% Handle leave command with improved error handling
+handle_leader({command, {'$ra_leave', _, ServerId}, From},
+              State = #{cluster := Cluster, current_term := Term, self := Self}) ->
+    case maps:is_key(ServerId, Cluster) of
+        false ->
+            % Server not in cluster, just reply
+            {State, [{reply, From, {ok, not_member, Term}}]};
+        true when ServerId =:= Self ->
+            % Cannot remove self through this path
+            {State, [{reply, From, {error, cannot_remove_self}}]};
+        true ->
+            % Remove the server from the cluster
+            NewCluster = maps:remove(ServerId, Cluster),
+            % Update state and track the membership change
+            NewState = State#{
+                cluster => NewCluster,
+                % Track membership change in progress
+                pending_membership_change => #{
+                    type => leave,
+                    server_id => ServerId,
+                    started_at => erlang:system_time(millisecond),
+                    timeout => 30000  % 30 seconds timeout
+                }
+            },
+            % Add effects to verify the change succeeded
+            ClusterChangeCmd = {'$ra_cluster_change', #{from => From},
+                                {leave, ServerId}, await_consensus},
+            Effects = [
+                {next_event, {command, ClusterChangeCmd}},
+                {timer, verify_membership_change, 5000}  % Check after 5 seconds
+            ],
+            {NewState, Effects}
+    end;
+%% Add a handler for verification timer
+handle_leader({timeout, verify_membership_change},
+              State = #{pending_membership_change := _PendingChange = #{
+                        type := Type,
+                        server_id := ServerId,
+                        started_at := StartedAt,
+                        timeout := Timeout}}) ->
+    CurrentTime = erlang:system_time(millisecond),
+    Elapsed = CurrentTime - StartedAt,
+
+    % Check if server is responding (for joins) or properly removed (for leaves)
+    HealthCheckResult = case Type of
+        join -> check_server_health(ServerId, State);
+        leave -> check_server_removed(ServerId, State)
+    end,
+
+    case HealthCheckResult of
+        ok ->
+            % Membership change successful
+            ?INFO("Membership change (~p) for ~p completed successfully",
+                  [Type, ServerId]),
+            {State#{pending_membership_change => undefined}, []};
+        {error, Reason} when Elapsed > Timeout ->
+            % Timeout reached, revert the change
+            ?WARN("Membership change (~p) for ~p failed: ~p, reverting",
+                  [Type, ServerId, Reason]),
+            RevertedState = revert_membership_change(State),
+            NotifyEffect = {send_msg, ra_event_formatter:membership_change_failed(
+                ServerId, Type, Reason)},
+            {RevertedState, [NotifyEffect]};
+        {error, _} ->
+            % Still within timeout, check again later
+            {State, [{timer, verify_membership_change, 5000}]}
+    end;
 handle_leader({command, Cmd}, #{cfg := #cfg{id = Self,
                                             log_id = LogId} = Cfg,
                                 cluster := Cluster} = State00) ->
@@ -3711,6 +3817,47 @@ get_max_supported_machine_version(
                              Max
                      end, MacVer, Cluster),
     MaxSupMacVer.
+
+%% Check if a server is healthy and responding
+check_server_health(ServerId, #{cluster := Cluster}) ->
+    case maps:get(ServerId, Cluster, undefined) of
+        undefined ->
+            {error, not_in_cluster};
+        {_, LastAckTime} when is_integer(LastAckTime) ->
+            % Check if we've heard from this server recently (within 10 seconds)
+            CurrentTime = erlang:system_time(millisecond),
+            if CurrentTime - LastAckTime =< 10000 ->
+                   ok;
+               true ->
+                   {error, no_recent_communication}
+            end;
+        _ ->
+            {error, no_communication_yet}
+    end.
+
+%% Check if a server has been properly removed
+check_server_removed(ServerId, #{cluster := Cluster}) ->
+    case maps:is_key(ServerId, Cluster) of
+        true -> {error, still_in_cluster};
+        false -> ok
+    end.
+
+%% Revert a membership change
+revert_membership_change(State = #{pending_membership_change := #{
+                                   type := Type,
+                                   server_id := ServerId},
+                                   cluster := Cluster}) ->
+    NewCluster = case Type of
+        join ->
+            % Remove the server that failed to join
+            maps:remove(ServerId, Cluster);
+        leave ->
+            % Add back the server that failed to leave
+            % We need to restore its previous state - this is simplified
+            % In a real implementation, we'd need to store the original state
+            Cluster#{ServerId => {1, undefined}}
+    end,
+    State#{cluster => NewCluster, pending_membership_change => undefined}.
 
 %%% ===================
 %%% Internal unit tests

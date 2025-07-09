@@ -1950,7 +1950,13 @@ make_rpc_effect(PeerId, #{next_index := Next}, MaxBatchSize,
                     %% and we don't pipeline entries until after snapshot
                     {LastIdx,
                      {send_snapshot, PeerId, {SnapState, Id, Term}},
-                     State#{log => Log}}
+                     State#{log => Log}};
+                undefined ->
+                    % No snapshot available yet - start from index 0 (like log_fold uses index 1)
+                    ?DEBUG("~ts: no snapshot available for RPC to ~w, using PrevIdx=0",
+                           [log_id(State), PeerId]),
+                    make_append_entries_rpc(PeerId, 0, 0, MaxBatchSize,
+                                            State#{log => Log}, EntryCache)
             end
     end.
 

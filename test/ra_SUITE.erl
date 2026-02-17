@@ -11,6 +11,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("kernel/include/file.hrl").
 -include("src/ra.hrl").
 
 -define(PROCESS_COMMAND_TIMEOUT, 6000).
@@ -76,7 +77,8 @@ all_tests() ->
      voter_gets_promoted_consistent_leader,
      voter_gets_promoted_new_leader,
      unknown_leader_call,
-     unknown_local_call
+     unknown_local_call,
+     corrupt_segment_permanently_kills_server
     ].
 
 groups() ->
@@ -334,6 +336,89 @@ server_recovery(Config) ->
     % issue command
     {ok, _, _Leader} = ra:process_command(N, 5, ?PROCESS_COMMAND_TIMEOUT),
     terminate_cluster([N1, N2]).
+
+corrupt_segment_permanently_kills_server(Config) ->
+    %% Demonstrates that a corrupt Raft log segment permanently kills a Ra
+    %% server with no automatic recovery. When a segment file is truncated,
+    %% the Ra process crashes during recovery with {missing_key, ...}. The
+    %% supervisor exhausts its restart intensity (3 crashes in <5s) and the
+    %% temporary child spec means the process is never restarted.
+    %%
+    %% After this, the server is registered in ra_directory but has no
+    %% running process. Subsequent restart attempts fail with the same
+    %% crash. The cluster continues operating with reduced redundancy
+    %% but the member is silently lost.
+    [A, _B, _C] = Cluster =
+        start_local_cluster(3, ?config(test_name, Config),
+                            {simple, fun erlang:'+'/2, 0}),
+
+    %% Write enough data to ensure WAL entries exist for all nodes.
+    lists:foreach(
+      fun(N) ->
+              {ok, _, _} = ra:process_command(A, N, ?PROCESS_COMMAND_TIMEOUT)
+      end, lists:seq(1, 200)),
+
+    %% Force WAL rollover so entries are flushed to segment files on disk.
+    ok = ra_log_wal:force_roll_over(ra_log_wal),
+    timer:sleep(1000),
+
+    %% Identify a follower to corrupt.
+    {ok, _, Leader} = ra:members(A),
+    Follower = hd([N || N <- Cluster, N =/= Leader]),
+    {FollowerName, _} = Follower,
+
+    %% Stop the follower cleanly.
+    ok = ra:stop_server(?SYS, Follower),
+
+    %% Locate and corrupt its segment files by truncating them.
+    UId = ra_directory:uid_of(?SYS, FollowerName),
+    DataDir = ra_env:server_data_dir(?SYS, UId),
+    SegmentFiles = filelib:wildcard(filename:join(DataDir, "*.segment")),
+    ct:pal("Corrupting ~b segment files in ~ts", [length(SegmentFiles), DataDir]),
+    ?assert(length(SegmentFiles) > 0),
+    lists:foreach(
+      fun(F) ->
+              {ok, Info} = file:read_file_info(F),
+              OrigSize = Info#file_info.size,
+              %% Truncate to half size to corrupt the data portion
+              %% while leaving the index intact, causing missing_key
+              %% errors during recovery.
+              {ok, Fd} = file:open(F, [write, raw]),
+              {ok, _} = file:position(Fd, OrigSize div 2),
+              ok = file:truncate(Fd),
+              ok = file:close(Fd),
+              ct:pal("Truncated ~ts from ~b to ~b bytes",
+                     [F, OrigSize, OrigSize div 2])
+      end, SegmentFiles),
+
+    %% Attempt to restart the server. This will crash during recovery
+    %% due to the corrupt segment. The supervisor will retry and exhaust
+    %% its restart intensity, permanently killing the process.
+    Result = ra:restart_server(?SYS, Follower),
+    ct:pal("First restart attempt result: ~p", [Result]),
+
+    %% Give the supervisor time to exhaust restart intensity.
+    timer:sleep(3000),
+
+    %% The server process should be permanently dead.
+    ?assertEqual(undefined, whereis(FollowerName)),
+
+    %% The server is still registered in ra_directory (it has data on disk)
+    %% but has no running process.
+    ?assertNotEqual(undefined, ra_directory:uid_of(?SYS, FollowerName)),
+
+    %% A subsequent restart attempt also fails -- the corrupt segment
+    %% causes the same crash loop.
+    _ = ra:restart_server(?SYS, Follower),
+    timer:sleep(3000),
+    ?assertEqual(undefined, whereis(FollowerName)),
+
+    %% Meanwhile, the remaining cluster members are fully operational.
+    Remaining = [N || N <- Cluster, N =/= Follower],
+    {ok, _, _} = ra:process_command(hd(Remaining), 999,
+                                    ?PROCESS_COMMAND_TIMEOUT),
+
+    terminate_cluster(Remaining).
 
 process_command(Config) ->
     [A, _B, _C] = Cluster =

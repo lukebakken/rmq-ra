@@ -57,6 +57,9 @@
                     low_priority_commands_flush_size => non_neg_integer(),
                     low_priority_commands_in_memory_size => non_neg_integer(),
                     server_recovery_strategy => undefined | registered | {module(), atom(), list()},
+                    server_recovery_scan_interval => non_neg_integer(),
+                    server_recovery_initial_backoff => non_neg_integer(),
+                    server_recovery_max_backoff => non_neg_integer(),
                     machine_upgrade_strategy => ra_server:machine_upgrade_strategy()
                    }.
 

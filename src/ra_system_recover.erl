@@ -107,20 +107,38 @@ handle_info(scan, #state{system = System,
                          failed = Failed0,
                          initial_backoff = InitialBackoff,
                          max_backoff = MaxBackoff} = State) ->
-    Now = erlang:monotonic_time(millisecond),
     Registered = ra_directory:list_registered(System),
+    ?DEBUG("~s: scanning system ~ts, ~b registered servers",
+           [?MODULE, System, length(Registered)]),
+    Now = erlang:monotonic_time(millisecond),
     Failed =
         lists:foldl(
           fun({Name, _UId}, Acc) ->
                   case ra_directory:where_is(System, Name) of
                       Pid when is_pid(Pid) ->
-                          case maps:is_key(Name, Acc) of
+                          case is_process_alive(Pid) of
                               true ->
-                                  ?INFO("~s: ra server ~w recovered",
-                                        [?MODULE, Name]),
-                                  maps:remove(Name, Acc);
+                                  case maps:is_key(Name, Acc) of
+                                      true ->
+                                          ?INFO("~s: ra server ~w recovered",
+                                                [?MODULE, Name]),
+                                          maps:remove(Name, Acc);
+                                      false ->
+                                          Acc
+                                  end;
                               false ->
-                                  Acc
+                                  case maps:get(Name, Acc, undefined) of
+                                      undefined ->
+                                          attempt_restart(System, Name,
+                                                          InitialBackoff,
+                                                          MaxBackoff, Acc);
+                                      {NextRetry, _Backoff} when Now >= NextRetry ->
+                                          attempt_restart(System, Name,
+                                                          InitialBackoff,
+                                                          MaxBackoff, Acc);
+                                      {_NextRetry, _Backoff} ->
+                                          Acc
+                                  end
                           end;
                       undefined ->
                           case maps:get(Name, Acc, undefined) of

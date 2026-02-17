@@ -78,7 +78,8 @@ all_tests() ->
      voter_gets_promoted_new_leader,
      unknown_leader_call,
      unknown_local_call,
-     corrupt_segment_permanently_kills_server
+     corrupt_segment_permanently_kills_server,
+     periodic_recovery_restarts_stopped_server
     ].
 
 groups() ->
@@ -419,6 +420,63 @@ corrupt_segment_permanently_kills_server(Config) ->
                                     ?PROCESS_COMMAND_TIMEOUT),
 
     terminate_cluster(Remaining).
+
+periodic_recovery_restarts_stopped_server(Config) ->
+    %% Demonstrates that the periodic recovery mechanism in
+    %% ra_system_recover detects a stopped Ra server and restarts it.
+    %% Uses a custom Ra system with server_recovery_strategy configured
+    %% and a short scan interval.
+    Sys = periodic_recovery_test_sys,
+    PrivDir = ?config(priv_dir, Config),
+    DataDir = filename:join([PrivDir, atom_to_list(Sys)]),
+    ok = filelib:ensure_dir(filename:join(DataDir, "dummy")),
+    SysCfg = #{name => Sys,
+               data_dir => DataDir,
+               names => ra_system:derive_names(Sys),
+               server_recovery_strategy => registered,
+               server_recovery_scan_interval => 1000,
+               server_recovery_initial_backoff => 500,
+               server_recovery_max_backoff => 2000,
+               segment_max_entries => 128},
+    {ok, _} = ra_system:start(SysCfg),
+
+    ClusterName = atom_to_list(?FUNCTION_NAME),
+    Nodes = [{ra_server:name(ClusterName, integer_to_list(N)), node()}
+             || N <- lists:seq(1, 3)],
+    Machine = {simple, fun erlang:'+'/2, 0},
+    {ok, Started, []} = ra:start_cluster(Sys, ClusterName, Machine, Nodes),
+    ct:pal("Started cluster: ~p", [Started]),
+
+    %% Write some data.
+    {ok, _, Leader} = ra:process_command(hd(Nodes), 5, ?PROCESS_COMMAND_TIMEOUT),
+
+    %% Pick a follower and stop it. Because ra_server_sup is a temporary
+    %% child, stopping it means the supervisor is gone and the process
+    %% will not be restarted by the supervision tree.
+    Follower = hd([N || N <- Nodes, N =/= Leader]),
+    {FollowerName, _} = Follower,
+    ok = ra:stop_server(Sys, Follower),
+    timer:sleep(500),
+
+    %% Confirm the server is dead.
+    ?assertEqual(undefined, whereis(FollowerName)),
+
+    %% Wait for the periodic scan to detect and restart the server.
+    %% Scan interval is 1000ms, so 5 seconds is plenty.
+    Recovered = lists:any(
+                  fun(_) ->
+                          timer:sleep(1000),
+                          whereis(FollowerName) =/= undefined
+                  end, lists:seq(1, 5)),
+    ?assert(Recovered),
+    ct:pal("Server ~w recovered by periodic scan", [FollowerName]),
+
+    %% Verify the recovered server is functional.
+    {ok, _, _} = ra:process_command(Follower, 10, ?PROCESS_COMMAND_TIMEOUT),
+
+    %% Cleanup.
+    [ra:stop_server(Sys, N) || N <- Nodes],
+    ra_system:stop(Sys).
 
 process_command(Config) ->
     [A, _B, _C] = Cluster =

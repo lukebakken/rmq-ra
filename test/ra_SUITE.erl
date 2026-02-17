@@ -11,6 +11,7 @@
 
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("common_test/include/ct.hrl").
+-include_lib("kernel/include/file.hrl").
 -include("src/ra.hrl").
 
 -define(PROCESS_COMMAND_TIMEOUT, 6000).
@@ -76,7 +77,8 @@ all_tests() ->
      voter_gets_promoted_consistent_leader,
      voter_gets_promoted_new_leader,
      unknown_leader_call,
-     unknown_local_call
+     unknown_local_call,
+     recover_from_corrupt_segment
     ].
 
 groups() ->
@@ -334,6 +336,112 @@ server_recovery(Config) ->
     % issue command
     {ok, _, _Leader} = ra:process_command(N, 5, ?PROCESS_COMMAND_TIMEOUT),
     terminate_cluster([N1, N2]).
+
+recover_from_corrupt_segment(Config) ->
+    %% Verifies that a Ra server with a corrupt Raft log segment recovers
+    %% by falling back to its last snapshot rather than crashing permanently.
+    %%
+    %% Uses ra_kv machine which supports explicit snapshot triggers via
+    %% take_snapshot/1. After writing data and forcing a snapshot, the
+    %% segment files are corrupted. The server should detect the corruption
+    %% during recovery, reset to its snapshot state, and rejoin the cluster
+    %% via normal Raft replication from the leader.
+    Sys = recover_corrupt_seg_sys,
+    PrivDir = ?config(priv_dir, Config),
+    DataDir = filename:join([PrivDir, atom_to_list(Sys)]),
+    ok = filelib:ensure_dir(filename:join(DataDir, "dummy")),
+    SysCfg = #{name => Sys,
+               data_dir => DataDir,
+               names => ra_system:derive_names(Sys),
+               server_recovery_strategy => registered,
+               segment_max_entries => 128},
+    {ok, _} = ra_system:start(SysCfg),
+
+    ClusterName = recover_from_corrupt_segment,
+    Nodes = [{ra_server:name(atom_to_list(ClusterName), integer_to_list(N)),
+              node()} || N <- lists:seq(1, 3)],
+    {ok, Started, []} = ra_kv:start_cluster(Sys, ClusterName,
+                                            #{members => Nodes}),
+    ct:pal("Started cluster: ~p", [Started]),
+
+    %% Write data.
+    [begin {ok, _} = ra_kv:put(hd(Nodes), N, N, ?PROCESS_COMMAND_TIMEOUT) end
+     || N <- lists:seq(1, 50)],
+
+    %% Force a snapshot on all nodes.
+    [ok = ra_kv:take_snapshot(N) || N <- Nodes],
+    timer:sleep(2000),
+
+    %% Force WAL rollover so entries are flushed to segment files.
+    {ok, WalName} = ra_system:lookup_name(Sys, wal),
+    ok = ra_log_wal:force_roll_over(WalName),
+    timer:sleep(1000),
+
+    %% Write more data AFTER the snapshot so segments contain entries
+    %% beyond the snapshot index.
+    [begin {ok, _} = ra_kv:put(hd(Nodes), 100 + N, 100 + N, ?PROCESS_COMMAND_TIMEOUT) end
+     || N <- lists:seq(1, 50)],
+
+    %% Force another WAL rollover.
+    ok = ra_log_wal:force_roll_over(WalName),
+    timer:sleep(1000),
+
+    %% Identify a follower.
+    {ok, _, Leader} = ra:members(hd(Nodes)),
+    Follower = hd([N || N <- Nodes, N =/= Leader]),
+    {FollowerName, _} = Follower,
+
+    %% Stop the follower.
+    ok = ra:stop_server(Sys, Follower),
+    timer:sleep(500),
+
+    %% Corrupt its segment files by truncating them.
+    UId = ra_directory:uid_of(Sys, FollowerName),
+    ServerDataDir = ra_env:server_data_dir(Sys, UId),
+    SegmentFiles = filelib:wildcard(filename:join(ServerDataDir, "*.segment")),
+    ct:pal("Corrupting ~b segment files in ~ts",
+           [length(SegmentFiles), ServerDataDir]),
+    ?assert(length(SegmentFiles) > 0),
+    lists:foreach(
+      fun(F) ->
+              {ok, Info} = file:read_file_info(F),
+              OrigSize = Info#file_info.size,
+              {ok, Fd} = file:open(F, [write, raw]),
+              {ok, _} = file:position(Fd, OrigSize div 2),
+              ok = file:truncate(Fd),
+              ok = file:close(Fd),
+              ct:pal("Truncated ~ts from ~b to ~b bytes",
+                     [F, OrigSize, OrigSize div 2])
+      end, SegmentFiles),
+
+    %% Verify a snapshot exists (the test depends on this).
+    SnapshotsDir = filename:join(ServerDataDir, "snapshots"),
+    {ok, SnapFiles} = file:list_dir(SnapshotsDir),
+    SnapDirs = [S || S <- SnapFiles, S =/= ".", S =/= ".."],
+    ct:pal("Snapshot directories: ~p", [SnapDirs]),
+    ?assert(length(SnapDirs) > 0),
+
+    %% Restart the follower. With the fix, it should recover from the
+    %% snapshot instead of crashing permanently.
+    Result = ra:restart_server(Sys, Follower),
+    ct:pal("Restart result: ~p", [Result]),
+
+    %% Give it time to recover and catch up from the leader.
+    timer:sleep(5000),
+
+    %% The server should be alive.
+    ?assertNotEqual(undefined, whereis(FollowerName)),
+
+    %% Verify data is consistent -- the follower should have caught up
+    %% from the leader and have all the data.
+    {ok, Value, _} = ra_kv:get(Follower, 50, ?PROCESS_COMMAND_TIMEOUT),
+    ?assertEqual(50, Value),
+    {ok, Value2, _} = ra_kv:get(Follower, 150, ?PROCESS_COMMAND_TIMEOUT),
+    ?assertEqual(150, Value2),
+
+    %% Cleanup.
+    [ra:stop_server(Sys, N) || N <- Nodes],
+    ra_system:stop(Sys).
 
 process_command(Config) ->
     [A, _B, _C] = Cluster =

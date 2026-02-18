@@ -421,7 +421,14 @@ callback_mode() -> [state_functions, state_enter].
 post_init(enter, _OldState, State) ->
     {keep_state, State, []};
 post_init(internal, {go, {ReplyToRef, ReplyToPid}}, Config) ->
-    State = do_init(Config),
+    State = try do_init(Config)
+            catch error:{badmatch, {error, invalid_segment_format}} ->
+                      handle_corrupt_log_init(Config);
+                  exit:{missing_key, _, _} ->
+                      handle_corrupt_log_init(Config);
+                  exit:{ra_log_segment_unexpected_eof, _, _, _} ->
+                      handle_corrupt_log_init(Config)
+            end,
     ReplyToPid ! {ReplyToRef, ok},
     {next_state, recover, State, [{next_event, internal, go}]}.
 
@@ -429,7 +436,17 @@ recover(enter, OldState, State0) ->
     {State, Actions} = handle_enter(?FUNCTION_NAME, OldState, State0),
     {keep_state, State, Actions};
 recover(internal, go, State = #state{server_state = ServerState0}) ->
-    ServerState = ra_server:recover(ServerState0),
+    ServerState =
+        try ra_server:recover(ServerState0)
+        catch exit:{missing_key, _, _} = Err ->
+                  ?WARN("~ts: recovery failed with ~p, resetting to snapshot",
+                        [log_id(State), Err]),
+                  ra_server:reset_to_snapshot(ServerState0);
+              exit:{ra_log_segment_unexpected_eof, _, _, _} = Err ->
+                  ?WARN("~ts: recovery failed with ~p, resetting to snapshot",
+                        [log_id(State), Err]),
+                  ra_server:reset_to_snapshot(ServerState0)
+        end,
     incr_counter(State#state.conf, ?C_RA_SRV_GCS, 1),
     %% we have to issue the next_event here so that the recovered state is
     %% only passed through very briefly
@@ -1276,6 +1293,38 @@ format_status(#{state := StateName,
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+handle_corrupt_log_init(#{uid := UId,
+                          system_config :=
+                              #{data_dir := DataDir,
+                                names := #{log_meta := MetaName}}} = Config) ->
+    Dir = filename:join(DataDir, UId),
+    {ok, Files} = prim_file:list_dir(Dir),
+    SegmentFiles = [filename:join(Dir, list_to_binary(F))
+                    || F <- Files,
+                       filename:extension(F) =:= ".segment"],
+    ?WARN("ra_server_proc: corrupt segment(s) detected during init, "
+          "deleting ~b segment files in ~ts and retrying",
+          [length(SegmentFiles), Dir]),
+    [ok = prim_file:delete(F) || F <- SegmentFiles],
+    %% Find the snapshot index from the snapshots directory.
+    %% Snapshot dirs are named "TERM_INDEX" (zero-padded hex).
+    SnapshotsDir = filename:join(Dir, "snapshots"),
+    SnapIdx = case prim_file:list_dir(SnapshotsDir) of
+                  {ok, SnapEntries} ->
+                      case lists:reverse(lists:sort(SnapEntries)) of
+                          [Latest | _] ->
+                              [_, IdxStr] = string:split(Latest, "_"),
+                              list_to_integer(IdxStr, 16);
+                          [] ->
+                              0
+                      end;
+                  _ ->
+                      0
+              end,
+    %% Reset last_applied to the snapshot index so recovery is a no-op.
+    ok = ra_log_meta:store_sync(MetaName, UId, last_applied, SnapIdx),
+    do_init(Config).
 
 handle_enter(RaftState, OldRaftState,
              #state{conf = #conf{name = Name},

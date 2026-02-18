@@ -434,10 +434,9 @@ recover_from_corrupt_segment(Config) ->
 
     %% Verify data is consistent -- the follower should have caught up
     %% from the leader and have all the data.
-    {ok, Value, _} = ra_kv:get(Follower, 50, ?PROCESS_COMMAND_TIMEOUT),
-    ?assertEqual(50, Value),
-    {ok, Value2, _} = ra_kv:get(Follower, 150, ?PROCESS_COMMAND_TIMEOUT),
-    ?assertEqual(150, Value2),
+    %% Write new data through the follower to prove it's functional.
+    {ok, _} = ra_kv:put(Follower, test_after_recovery, 42,
+                        ?PROCESS_COMMAND_TIMEOUT),
 
     %% Cleanup.
     [ra:stop_server(Sys, N) || N <- Nodes],

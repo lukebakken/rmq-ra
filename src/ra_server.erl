@@ -62,6 +62,7 @@
          get_membership/1,
          get_condition_timeout/2,
          recover/1,
+         reset_to_snapshot/1,
          state_query/2,
          fetch_term/2,
          transform_for_partial_read/3
@@ -494,6 +495,45 @@ recover(#{cfg := #cfg{log_id = LogId,
     State#{
            %% reset commit latency as recovery may calculate a very old value
            commit_latency => 0}.
+
+-spec reset_to_snapshot(ra_server_state()) -> ra_server_state().
+reset_to_snapshot(#{cfg := #cfg{log_id = LogId,
+                                uid = UId,
+                                system_config =
+                                    #{data_dir := DataDir} = SysCfg} = Cfg,
+                    log := Log0} = State) ->
+    case ra_log:snapshot_index_term(Log0) of
+        undefined ->
+            ?ERR("~ts: cannot reset to snapshot, no snapshot exists",
+                 [LogId]),
+            exit({error, no_snapshot_for_reset});
+        {SnapIdx, SnapTerm} ->
+            ?WARN("~ts: resetting to snapshot at index ~b term ~b",
+                  [LogId, SnapIdx, SnapTerm]),
+            %% delete all segment files
+            Dir = filename:join(DataDir, UId),
+            {ok, AllFiles} = prim_file:list_dir(Dir),
+            SegmentFiles = [filename:join(Dir, list_to_binary(F))
+                            || F <- AllFiles,
+                               filename:extension(F) =:= ".segment"],
+            [begin
+                 ?DEBUG("~ts: deleting corrupt segment ~ts", [LogId, F]),
+                 ok = prim_file:delete(F)
+             end || F <- SegmentFiles],
+            %% reset last_applied in meta store
+            MetaName = meta_name(SysCfg),
+            ok = ra_log_meta:store_sync(MetaName, UId, last_applied, SnapIdx),
+            %% re-initialize the log (will find snapshot but no segments)
+            Log = ra_log:init(#{uid => UId,
+                                system_config => SysCfg,
+                                log_id => LogId}),
+            put_counter(Cfg, ?C_RA_SVR_METRIC_COMMIT_LATENCY, 0),
+            State#{log => Log,
+                   last_applied => SnapIdx,
+                   commit_index => SnapIdx,
+                   persisted_last_applied => SnapIdx,
+                   commit_latency => 0}
+    end.
 
 -spec handle_leader(ra_msg(), ra_server_state()) ->
     {ra_state(), ra_server_state(), effects()}.
